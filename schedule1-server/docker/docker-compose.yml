@@ -1,0 +1,35 @@
+# Docker alternative to the native `s1ds` script.
+# Uses the official S1DedicatedServers image (Wine 11 + MelonLoader + the mod).
+#
+#   cp .env.example .env    # then edit .env
+#   docker compose up -d
+#   docker compose logs -f
+#
+# Server settings live in the s1ds_game volume at UserData/server_config.toml.
+# Edit them with:
+#   docker compose exec s1ds nano "/home/steam/game/UserData/server_config.toml"
+# or copy them out and back with `docker compose cp`.
+services:
+  s1ds:
+    image: ${S1DS_IMAGE:-ghcr.io/ifbars/s1dedicatedservers:1.1.6}
+    container_name: s1ds
+    restart: unless-stopped
+    env_file:
+      - .env
+    # Note: the upstream image does not wire a console to stdin, so server
+    # commands are run in game by players you grant the operator group in
+    # UserData/permissions.toml. The native `s1ds` script has a full console.
+    stop_grace_period: 90s
+    ports:
+      - "38465:38465/udp"   # game traffic
+      - "38465:38465/tcp"   # S1DS status query
+      - "27016:27016/udp"   # Steam query
+    volumes:
+      - s1ds_game:/home/steam/game
+      - s1ds_steamcmd:/home/steam/steamcmd
+      - s1ds_steam_home:/home/steam/Steam
+
+volumes:
+  s1ds_game:
+  s1ds_steamcmd:
+  s1ds_steam_home:
