@@ -1,0 +1,54 @@
+# s1ds.conf: settings for the Schedule I dedicated server manager (s1ds).
+#
+# `s1ds install` copies this file to $S1DS_HOME/s1ds.conf (default
+# ~/schedule1-server/s1ds.conf). Edit that copy, not this example.
+# This file is sourced by bash, so use bash syntax (no spaces around "=").
+
+# --- Steam ------------------------------------------------------------------
+# The Steam account used to download the game. It must own Schedule I.
+# You are asked for the password and Steam Guard code once, interactively.
+# SteamCMD caches the login, so no password is stored in this file.
+STEAM_USER=""
+
+# Game runtime: "mono" (recommended, most tested on Wine) or "il2cpp".
+#   mono   -> downloads the Steam "alternate" beta branch of the game.
+#   il2cpp -> downloads the normal (public) branch of the game.
+# Players must use the SAME runtime/branch and the matching S1DS client mod.
+RUNTIME="mono"
+
+# Override the Steam branch. Leave empty to pick it from RUNTIME.
+STEAM_BRANCH=""
+
+# --- Mod versions -----------------------------------------------------------
+# S1DedicatedServers release tag, e.g. "v1.1.6", or "latest".
+# Pin a version if you want updates to happen only when you choose.
+S1DS_VERSION="latest"
+
+# MelonLoader release tag. S1DS supports 0.6.x, 0.7.0 and 0.7.2+ (NOT 0.7.1).
+MELONLOADER_VERSION="v0.7.2"
+
+# --- First-boot server settings ---------------------------------------------
+# These values seed game/UserData/server_config.toml the first time only.
+# After that, edit the TOML with `s1ds config` (it is the source of truth).
+SERVER_NAME="Schedule I Dedicated Server"
+SERVER_DESCRIPTION="Hosted on Linux"
+MAX_PLAYERS=8
+SERVER_PORT=38465          # UDP game traffic + TCP status query
+QUERY_PORT=27016           # UDP Steam query
+SERVER_PASSWORD=""         # empty = no password
+AUTH_PROVIDER="SteamGameServer"   # or "None" for LAN-only testing
+MESSAGING_BACKEND="FishNetRpc"    # or "SteamNetworkingSockets"
+
+# --- Runtime ----------------------------------------------------------------
+# Extra arguments passed to the game. Bash array, e.g.:
+#   EXTRA_ARGS=(--target-framerate 30 --verbose)
+EXTRA_ARGS=()
+
+# Seconds to wait for a clean save + shutdown before killing the process.
+SHUTDOWN_TIMEOUT=60
+
+# Number of backups to keep in $S1DS_HOME/backups (oldest are deleted).
+BACKUP_KEEP=14
+
+# Name of the systemd user service created by `s1ds service install`.
+SERVICE_NAME="schedule1"

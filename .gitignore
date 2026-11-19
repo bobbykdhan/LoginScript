@@ -1,2 +1,3 @@
 /secrets.env
 /secret.json
+schedule1-server/docker/.env

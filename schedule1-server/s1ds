@@ -1,0 +1,996 @@
+#!/usr/bin/env bash
+# s1ds: install and run a Schedule I dedicated server on Linux.
+#
+# Schedule I has no native Linux or official dedicated server. This script runs
+# the Windows game headless under Wine with the community S1DedicatedServers
+# mod (https://github.com/ifBars/S1DedicatedServers) loaded by MelonLoader.
+# It follows the same steps as that project's official Docker image.
+#
+# Run `s1ds help` for usage.
+
+set -Eeuo pipefail
+
+readonly APP_ID=3164500
+readonly REDIST_APP_ID=1007
+readonly S1DS_REPO="ifBars/S1DedicatedServers"
+readonly ML_REPO="LavaGang/MelonLoader"
+readonly STEAMCMD_URL="https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz"
+readonly WINETRICKS_URL="https://raw.githubusercontent.com/Winetricks/winetricks/master/src/winetricks"
+readonly GAME_EXE="Schedule I.exe"
+
+SCRIPT_PATH=$(readlink -f "${BASH_SOURCE[0]}")
+SCRIPT_DIR=$(dirname "$SCRIPT_PATH")
+
+S1DS_HOME=${S1DS_HOME:-"$HOME/schedule1-server"}
+CONF_FILE="$S1DS_HOME/s1ds.conf"
+STEAMCMD_DIR="$S1DS_HOME/steamcmd"
+GAME_DIR="$S1DS_HOME/game"
+REDIST_DIR="$S1DS_HOME/steamworks_redist"
+CACHE_DIR="$S1DS_HOME/cache"
+BIN_DIR="$S1DS_HOME/bin"
+LOG_DIR="$S1DS_HOME/logs"
+RUN_DIR="$S1DS_HOME/run"
+BACKUP_DIR="$S1DS_HOME/backups"
+LOG_FILE="$LOG_DIR/console.log"
+FIFO="$RUN_DIR/console.fifo"
+RUNNER_PID_FILE="$RUN_DIR/runner.pid"
+GAME_PID_FILE="$RUN_DIR/game.pid"
+LOCK_FILE="$RUN_DIR/s1ds.lock"
+CONFIG_TOML="$GAME_DIR/UserData/server_config.toml"
+PERMISSIONS_TOML="$GAME_DIR/UserData/permissions.toml"
+
+export WINEPREFIX="$S1DS_HOME/wineprefix"
+export WINEARCH=win64
+export WINEDEBUG=${WINEDEBUG:--all}
+
+# ---------------------------------------------------------------------------
+# Output helpers
+# ---------------------------------------------------------------------------
+if [[ -t 2 ]]; then
+    C_RESET=$'\e[0m'; C_BOLD=$'\e[1m'; C_RED=$'\e[31m'; C_YEL=$'\e[33m'; C_GRN=$'\e[32m'; C_BLU=$'\e[34m'
+else
+    C_RESET=""; C_BOLD=""; C_RED=""; C_YEL=""; C_GRN=""; C_BLU=""
+fi
+info() { printf '%s==>%s %s\n' "$C_BLU$C_BOLD" "$C_RESET" "$*" >&2; }
+ok()   { printf '%s ok%s %s\n' "$C_GRN$C_BOLD" "$C_RESET" "$*" >&2; }
+warn() { printf '%swarn%s %s\n' "$C_YEL$C_BOLD" "$C_RESET" "$*" >&2; }
+die()  { printf '%serror%s %s\n' "$C_RED$C_BOLD" "$C_RESET" "$*" >&2; exit 1; }
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+set_defaults() {
+    STEAM_USER=""
+    RUNTIME="mono"
+    STEAM_BRANCH=""
+    S1DS_VERSION="latest"
+    MELONLOADER_VERSION="v0.7.2"
+    SERVER_NAME="Schedule I Dedicated Server"
+    SERVER_DESCRIPTION="Hosted on Linux"
+    MAX_PLAYERS=8
+    SERVER_PORT=38465
+    QUERY_PORT=27016
+    SERVER_PASSWORD=""
+    AUTH_PROVIDER="SteamGameServer"
+    MESSAGING_BACKEND="FishNetRpc"
+    EXTRA_ARGS=()
+    SHUTDOWN_TIMEOUT=60
+    BACKUP_KEEP=14
+    SERVICE_NAME="schedule1"
+}
+
+load_config() {
+    set_defaults
+    if [[ -f "$CONF_FILE" ]]; then
+        # shellcheck source=s1ds.conf.example
+        source "$CONF_FILE"
+    fi
+    RUNTIME=${RUNTIME,,}
+    case "$RUNTIME" in
+        mono)   MOD_DLL="DedicatedServerMod_Mono_Server.dll";   MOD_ZIP="Mono-Server.zip";   DEFAULT_BRANCH="alternate" ;;
+        il2cpp) MOD_DLL="DedicatedServerMod_Il2cpp_Server.dll"; MOD_ZIP="Il2cpp_Server.zip"; DEFAULT_BRANCH="public" ;;
+        *) die "RUNTIME must be 'mono' or 'il2cpp' (got '$RUNTIME') in $CONF_FILE" ;;
+    esac
+    BRANCH=${STEAM_BRANCH:-$DEFAULT_BRANCH}
+    [[ "$SERVER_PORT" =~ ^[0-9]+$ ]] || die "SERVER_PORT must be a number"
+    [[ "$QUERY_PORT" =~ ^[0-9]+$ ]] || die "QUERY_PORT must be a number"
+    [[ "$MAX_PLAYERS" =~ ^[0-9]+$ ]] || die "MAX_PLAYERS must be a number"
+    [[ "$SHUTDOWN_TIMEOUT" =~ ^[0-9]+$ ]] || die "SHUTDOWN_TIMEOUT must be a number"
+    [[ "$BACKUP_KEEP" =~ ^[0-9]+$ ]] || die "BACKUP_KEEP must be a number"
+}
+
+ensure_config_file() {
+    mkdir -p "$S1DS_HOME"
+    if [[ ! -f "$CONF_FILE" ]]; then
+        cp "$SCRIPT_DIR/s1ds.conf.example" "$CONF_FILE"
+        ok "Created $CONF_FILE"
+    fi
+    load_config
+    if [[ -z "$STEAM_USER" ]]; then
+        [[ -t 0 ]] || die "Set STEAM_USER in $CONF_FILE (the Steam account that owns Schedule I)."
+        local user=""
+        read -r -p "Steam username that owns Schedule I: " user
+        [[ -n "$user" && "$user" =~ ^[A-Za-z0-9_.@-]+$ ]] || die "Invalid Steam username."
+        sed -i "s|^STEAM_USER=.*|STEAM_USER=\"$user\"|" "$CONF_FILE"
+        STEAM_USER="$user"
+        ok "Saved STEAM_USER to $CONF_FILE"
+    fi
+}
+
+make_dirs() {
+    mkdir -p "$STEAMCMD_DIR" "$GAME_DIR" "$REDIST_DIR" "$CACHE_DIR" "$BIN_DIR" \
+             "$LOG_DIR" "$RUN_DIR" "$BACKUP_DIR"
+}
+
+# ---------------------------------------------------------------------------
+# Process state
+# ---------------------------------------------------------------------------
+pid_alive() { [[ -n "${1:-}" ]] && kill -0 "$1" 2>/dev/null; }
+
+runner_pid() {
+    local pid=""
+    [[ -f "$RUNNER_PID_FILE" ]] && pid=$(<"$RUNNER_PID_FILE")
+    if pid_alive "$pid"; then echo "$pid"; fi
+}
+
+is_running() { [[ -n "$(runner_pid)" ]]; }
+
+service_file() { echo "$HOME/.config/systemd/user/$SERVICE_NAME.service"; }
+service_installed() { [[ -f "$(service_file)" ]] && have systemctl; }
+
+acquire_lock() {
+    mkdir -p "$RUN_DIR"
+    exec 9>"$LOCK_FILE"
+    flock -n 9 || die "Another s1ds process (server running, or an install/update) holds $LOCK_FILE. Stop it first."
+}
+
+require_stopped() {
+    is_running && die "The server is running. Stop it first with: s1ds stop"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Dependencies
+# ---------------------------------------------------------------------------
+check_deps() {
+    local missing=()
+    local cmd
+    for cmd in wine wineserver Xvfb curl unzip tar flock setsid cabextract ps timeout; do
+        have "$cmd" || missing+=("$cmd")
+    done
+    if ((${#missing[@]})); then
+        die "Missing commands: ${missing[*]}. Run: $SCRIPT_PATH deps"
+    fi
+    local ver major
+    ver=$(wine --version 2>/dev/null || true)
+    major=$(sed -E 's/^wine-([0-9]+).*/\1/' <<<"$ver")
+    if [[ "$major" =~ ^[0-9]+$ ]] && ((major < 9)); then
+        warn "$ver is old. Wine 9 or newer is recommended (the upstream Docker image uses Wine 11)."
+        warn "See https://gitlab.winehq.org/wine/wine/-/wikis/Download for newer packages."
+    fi
+}
+
+cmd_deps() {
+    local sudo=""
+    ((EUID == 0)) || sudo="sudo"
+    if have apt-get; then
+        info "Installing packages with apt (Debian/Ubuntu)"
+        $sudo dpkg --add-architecture i386
+        $sudo apt-get update
+        $sudo apt-get install -y --no-install-recommends \
+            wine wine64 wine32:i386 xvfb xauth cabextract curl unzip tar ca-certificates \
+            lib32gcc-s1 procps util-linux \
+        || $sudo apt-get install -y --no-install-recommends \
+            wine wine32:i386 xvfb xauth cabextract curl unzip tar ca-certificates \
+            lib32gcc-s1 procps util-linux
+    elif have dnf; then
+        info "Installing packages with dnf (Fedora/RHEL)"
+        $sudo dnf install -y wine xorg-x11-server-Xvfb cabextract curl unzip tar \
+            glibc.i686 libstdc++.i686 procps-ng util-linux
+    elif have pacman; then
+        info "Installing packages with pacman (Arch). The [multilib] repo must be enabled."
+        $sudo pacman -S --needed --noconfirm wine xorg-server-xvfb cabextract curl unzip tar \
+            lib32-gcc-libs procps-ng util-linux
+    elif have zypper; then
+        info "Installing packages with zypper (openSUSE)"
+        $sudo zypper --non-interactive install wine xorg-x11-server-Xvfb cabextract curl unzip tar \
+            libgcc_s1-32bit procps util-linux
+    else
+        die "Unknown package manager. Install manually: wine (64-bit, 9+), Xvfb, cabextract, curl, unzip, tar, 32-bit libgcc (for SteamCMD), util-linux."
+    fi
+    ok "System packages installed"
+    check_deps
+    ok "All required commands found ($(wine --version))"
+}
+
+ensure_winetricks() {
+    if have winetricks; then
+        WINETRICKS=$(command -v winetricks)
+    else
+        WINETRICKS="$BIN_DIR/winetricks"
+        if [[ ! -x "$WINETRICKS" ]]; then
+            info "Downloading winetricks"
+            download "$WINETRICKS_URL" "$WINETRICKS"
+            chmod +x "$WINETRICKS"
+        fi
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Downloads
+# ---------------------------------------------------------------------------
+download() {
+    local url=$1 dest=$2
+    local tmp="$dest.part"
+    curl -fsSL --retry 4 --retry-delay 3 --connect-timeout 20 -o "$tmp" "$url" \
+        || { rm -f "$tmp"; die "Download failed: $url"; }
+    mv -f "$tmp" "$dest"
+}
+
+release_url() {
+    local repo=$1 tag=$2 asset=$3
+    if [[ "$tag" == "latest" ]]; then
+        echo "https://github.com/$repo/releases/latest/download/$asset"
+    else
+        echo "https://github.com/$repo/releases/download/$tag/$asset"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Virtual display (Unity under Wine is more reliable with an X server present)
+# ---------------------------------------------------------------------------
+XVFB_PID=""
+start_xvfb() {
+    [[ -n "$XVFB_PID" ]] && return 0
+    local dfile="$RUN_DIR/xvfb.display"
+    rm -f "$dfile"
+    # setsid: a Ctrl+C in the terminal must not kill the display under a running game.
+    setsid Xvfb -displayfd 5 -screen 0 1024x768x24 -nolisten tcp -noreset +extension GLX \
+        5>"$dfile" 3>&- 9>&- </dev/null >/dev/null 2>&1 &
+    XVFB_PID=$!
+    local i
+    for ((i = 0; i < 100; i++)); do
+        [[ -s "$dfile" ]] && break
+        pid_alive "$XVFB_PID" || die "Xvfb failed to start"
+        sleep 0.1
+    done
+    [[ -s "$dfile" ]] || die "Xvfb did not report a display number"
+    DISPLAY=":$(tr -d '[:space:]' <"$dfile")"
+    export DISPLAY
+}
+
+stop_xvfb() {
+    if [[ -n "$XVFB_PID" ]]; then
+        kill "$XVFB_PID" 2>/dev/null || true
+        wait "$XVFB_PID" 2>/dev/null || true
+        XVFB_PID=""
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# SteamCMD and game files
+# ---------------------------------------------------------------------------
+steamcmd() { (cd "$STEAMCMD_DIR" && ./steamcmd.sh "$@"); }
+
+install_steamcmd() {
+    if [[ ! -x "$STEAMCMD_DIR/steamcmd.sh" ]]; then
+        info "Downloading SteamCMD"
+        download "$STEAMCMD_URL" "$CACHE_DIR/steamcmd_linux.tar.gz"
+        tar -xzf "$CACHE_DIR/steamcmd_linux.tar.gz" -C "$STEAMCMD_DIR"
+    fi
+    info "Updating SteamCMD"
+    steamcmd +quit || true   # first run self-updates and often exits non-zero
+}
+
+download_game() {
+    local validate=${1:-validate}
+    info "Downloading Schedule I (app $APP_ID, branch '$BRANCH') with Steam account '$STEAM_USER'"
+    if [[ -t 0 ]]; then
+        info "SteamCMD may ask for your password and Steam Guard code. They are cached by SteamCMD, not stored by s1ds."
+    fi
+    local args=(+@sSteamCmdForcePlatformType windows +force_install_dir "$GAME_DIR"
+                +login "$STEAM_USER" +app_update "$APP_ID" -beta "$BRANCH")
+    [[ "$validate" == "validate" ]] && args+=(validate)
+    args+=(+quit)
+    local attempt
+    for attempt in 1 2; do
+        if steamcmd "${args[@]}" && [[ -f "$GAME_DIR/$GAME_EXE" ]]; then
+            ok "Game files are up to date"
+            return 0
+        fi
+        warn "SteamCMD attempt $attempt did not finish cleanly"
+    done
+    [[ -f "$GAME_DIR/$GAME_EXE" ]] || die "Game download failed. Check the Steam login, that the account owns Schedule I, and disk space."
+    warn "SteamCMD reported an error but the game files exist; continuing."
+}
+
+download_redist() {
+    info "Downloading Steamworks redistributables (app $REDIST_APP_ID, anonymous)"
+    steamcmd +@sSteamCmdForcePlatformType windows +force_install_dir "$REDIST_DIR" \
+        +login anonymous +app_update "$REDIST_APP_ID" validate +quit || true
+}
+
+copy_steam_dlls() {
+    local dll src missing=()
+    for dll in steamclient64.dll tier0_s64.dll vstdlib_s64.dll steamclient.dll tier0_s.dll vstdlib_s.dll steam_api64.dll; do
+        src=""
+        if [[ "$dll" == steam_api64.dll ]]; then
+            [[ -f "$GAME_DIR/$dll" ]] && continue
+            src=$(find "$GAME_DIR" -type f -name "$dll" -print -quit 2>/dev/null || true)
+        fi
+        [[ -z "$src" ]] && src=$(find "$REDIST_DIR" -type f -name "$dll" -print -quit 2>/dev/null || true)
+        if [[ -n "$src" ]]; then
+            cp -f "$src" "$GAME_DIR/$dll"
+        else
+            missing+=("$dll")
+        fi
+    done
+    if ((${#missing[@]})); then
+        warn "Could not find Steam runtime DLLs: ${missing[*]}. Steam authentication may fail. Re-run: s1ds update"
+    else
+        ok "Steamworks DLLs copied into the game folder"
+    fi
+    printf '%s\n' "$APP_ID" >"$GAME_DIR/steam_appid.txt"
+}
+
+# ---------------------------------------------------------------------------
+# Wine prefix
+# ---------------------------------------------------------------------------
+setup_wineprefix() {
+    local marker="$WINEPREFIX/.s1ds-ready"
+    local need_dotnet=0
+    [[ "$RUNTIME" == il2cpp ]] && need_dotnet=1
+
+    if [[ -f "$marker" ]] && { ((need_dotnet == 0)) || [[ -d "$WINEPREFIX/drive_c/Program Files/dotnet/shared/Microsoft.WindowsDesktop.App" ]]; }; then
+        ok "Wine prefix ready ($WINEPREFIX)"
+        return 0
+    fi
+
+    ensure_winetricks
+    start_xvfb
+    if [[ ! -f "$WINEPREFIX/system.reg" ]]; then
+        info "Creating 64-bit Wine prefix at $WINEPREFIX"
+        wineboot --init >/dev/null 2>&1 9>&- || true
+        wineserver -w 9>&- || true
+    fi
+    info "Installing Visual C++ 2019 runtime into the prefix (takes a few minutes)"
+    "$WINETRICKS" -q vcrun2019 9>&- || warn "winetricks vcrun2019 reported an error (often harmless)"
+    if ((need_dotnet)); then
+        info "Installing .NET 6 desktop runtime for IL2CPP MelonLoader (takes a few minutes)"
+        "$WINETRICKS" -q dotnetdesktop6 9>&- || warn "winetricks dotnetdesktop6 reported an error"
+        [[ -d "$WINEPREFIX/drive_c/Program Files/dotnet/shared/Microsoft.WindowsDesktop.App" ]] \
+            || die ".NET 6 desktop runtime is missing from the Wine prefix; IL2CPP will not start. Try RUNTIME=mono."
+    fi
+    wineserver -w 9>&- || true
+    stop_xvfb
+    touch "$marker"
+    ok "Wine prefix ready"
+}
+
+# ---------------------------------------------------------------------------
+# MelonLoader + S1DedicatedServers
+# ---------------------------------------------------------------------------
+install_melonloader() {
+    local zip="$CACHE_DIR/MelonLoader.x64-$MELONLOADER_VERSION.zip"
+    [[ "$MELONLOADER_VERSION" == v0.7.1 ]] && die "MelonLoader v0.7.1 is not supported by S1DS. Use v0.7.2 or newer."
+    if [[ ! -s "$zip" || "$MELONLOADER_VERSION" == latest ]]; then
+        info "Downloading MelonLoader $MELONLOADER_VERSION"
+        download "$(release_url "$ML_REPO" "$MELONLOADER_VERSION" MelonLoader.x64.zip)" "$zip"
+    fi
+    unzip -qo "$zip" -d "$GAME_DIR"
+    [[ -f "$GAME_DIR/version.dll" ]] || die "MelonLoader install failed: version.dll missing"
+    ok "MelonLoader $MELONLOADER_VERSION installed"
+}
+
+install_s1ds_mod() {
+    local zip="$CACHE_DIR/S1DS-$S1DS_VERSION-$MOD_ZIP"
+    if [[ ! -s "$zip" || "$S1DS_VERSION" == latest ]]; then
+        info "Downloading S1DedicatedServers $S1DS_VERSION ($MOD_ZIP)"
+        download "$(release_url "$S1DS_REPO" "$S1DS_VERSION" "$MOD_ZIP")" "$zip"
+    fi
+    local tmp
+    tmp=$(mktemp -d "$CACHE_DIR/s1ds.XXXXXX")
+    unzip -qo "$zip" -d "$tmp"
+    [[ -f "$tmp/Mods/$MOD_DLL" ]] || { rm -rf "$tmp"; die "$MOD_ZIP does not contain Mods/$MOD_DLL"; }
+    mkdir -p "$GAME_DIR/Mods"
+    rm -f "$GAME_DIR/Mods/DedicatedServerMod_Mono_Server.dll" "$GAME_DIR/Mods/DedicatedServerMod_Il2cpp_Server.dll"
+    cp -f "$tmp/Mods/$MOD_DLL" "$GAME_DIR/Mods/$MOD_DLL"
+    local ver
+    ver=$(sed -nE 's/^Version: ([^<]+).*/\1/p' "$tmp/README.md" 2>/dev/null | head -n1 || true)
+    rm -rf "$tmp"
+    ok "S1DedicatedServers ${ver:-$S1DS_VERSION} installed ($MOD_DLL)"
+}
+
+clear_cpp2il_cache() {
+    local dir="$GAME_DIR/MelonLoader/Dependencies/Il2CppAssemblyGenerator/Cpp2IL/cpp2il_out"
+    if [[ -d "$dir" ]]; then
+        rm -rf -- "$dir"
+        info "Cleared stale Cpp2IL output (regenerated on next start)"
+    fi
+}
+
+toml_str() {
+    local s=$1
+    s=${s//\\/\\\\}
+    s=${s//\"/\\\"}
+    printf '"%s"' "$s"
+}
+
+seed_server_config() {
+    if [[ -f "$CONFIG_TOML" ]]; then
+        ok "Keeping existing $CONFIG_TOML"
+        return 0
+    fi
+    mkdir -p "$(dirname "$CONFIG_TOML")"
+    cat >"$CONFIG_TOML" <<EOF
+# Seeded by s1ds. On first boot the server adds every other option with
+# comments and its defaults. Edit with: s1ds config
+
+[server]
+serverName = $(toml_str "$SERVER_NAME")
+serverDescription = $(toml_str "$SERVER_DESCRIPTION")
+maxPlayers = $MAX_PLAYERS
+serverPort = $SERVER_PORT
+serverPassword = $(toml_str "$SERVER_PASSWORD")
+
+[authentication]
+authProvider = $(toml_str "$AUTH_PROVIDER")
+steamGameServerLogOnAnonymous = true
+steamGameServerQueryPort = $QUERY_PORT
+steamGameServerMode = "Authentication"
+
+[messaging]
+messagingBackend = $(toml_str "$MESSAGING_BACKEND")
+
+[tcpConsole]
+stdioConsoleMode = "Enabled"
+
+[webPanel]
+webPanelEnabled = false
+webPanelOpenBrowserOnStart = false
+EOF
+    ok "Wrote initial $CONFIG_TOML"
+}
+
+apply_payload() {
+    install_melonloader
+    install_s1ds_mod
+    copy_steam_dlls
+    [[ "$RUNTIME" == il2cpp ]] && clear_cpp2il_cache
+    seed_server_config
+}
+
+# ---------------------------------------------------------------------------
+# Commands: install / update
+# ---------------------------------------------------------------------------
+cmd_install() {
+    ensure_config_file
+    check_deps
+    make_dirs
+    acquire_lock
+    require_stopped
+    info "Installing into $S1DS_HOME (runtime: $RUNTIME, Steam branch: $BRANCH)"
+    install_steamcmd
+    download_game validate
+    download_redist
+    setup_wineprefix
+    apply_payload
+    cat >&2 <<EOF
+
+${C_GRN}${C_BOLD}Install complete.${C_RESET}
+
+  Start in this terminal:      $SCRIPT_PATH run
+  Or run as a background service that starts on boot:
+                               $SCRIPT_PATH service install
+  Open firewall ports:         $SCRIPT_PATH firewall
+  Edit server settings:        $SCRIPT_PATH config
+
+The first start takes several minutes while MelonLoader and the mod set up.
+Players need MelonLoader + the S1DS *client* mod for runtime '$RUNTIME'
+(Steam branch '$BRANCH'). See README.md.
+EOF
+}
+
+cmd_update() {
+    load_config
+    [[ -f "$GAME_DIR/$GAME_EXE" ]] || die "Not installed yet. Run: $SCRIPT_PATH install"
+    check_deps
+    make_dirs
+    local was_running=0
+    if is_running; then
+        was_running=1
+        info "Stopping the server for the update"
+        cmd_stop
+    fi
+    acquire_lock
+    if [[ "${1:-}" == "--backup" || "$was_running" == 1 ]]; then
+        do_backup "pre-update"
+    fi
+    install_steamcmd
+    download_game validate
+    download_redist
+    setup_wineprefix
+    apply_payload
+    flock -u 9
+    exec 9>&-
+    ok "Update complete"
+    if ((was_running)); then
+        info "Starting the server again"
+        cmd_start
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Command: run (foreground; used by the systemd service)
+# ---------------------------------------------------------------------------
+GAME_PID=""
+STOP_REQUESTED=0
+FORWARDER_PID=""
+
+send_console() {
+    # Writes one command line to the game's stdin (stdio console).
+    printf '%s\n' "$*" >&3 2>/dev/null || true
+}
+
+game_alive() {
+    # True while the game process exists and is not a zombie waiting to be reaped.
+    local st
+    [[ -n "$GAME_PID" ]] || return 1
+    st=$(ps -o stat= -p "$GAME_PID" 2>/dev/null) || return 1
+    [[ -n "$st" && "$st" != Z* ]]
+}
+
+graceful_stop() {
+    game_alive || return 0
+    info "Saving world and shutting down (up to ${SHUTDOWN_TIMEOUT}s)"
+    send_console "save"
+    local waited=0
+    while game_alive && ((waited < 5)); do sleep 1; waited=$((waited + 1)); done
+    send_console "shutdown Server is shutting down"
+    waited=0
+    while game_alive && ((waited < SHUTDOWN_TIMEOUT)); do
+        sleep 1
+        waited=$((waited + 1))
+    done
+    if game_alive; then
+        warn "Server did not exit in time; terminating"
+        kill -TERM "$GAME_PID" 2>/dev/null || true
+        waited=0
+        while game_alive && ((waited < 10)); do sleep 1; waited=$((waited + 1)); done
+        game_alive && kill -KILL "$GAME_PID" 2>/dev/null || true
+    fi
+    wineserver -k 9>&- 2>/dev/null || true
+}
+
+run_cleanup() {
+    [[ -n "$FORWARDER_PID" ]] && kill "$FORWARDER_PID" 2>/dev/null || true
+    game_alive && kill -TERM "$GAME_PID" 2>/dev/null || true
+    wineserver -k 9>&- 2>/dev/null || true
+    stop_xvfb
+    exec 3>&- 2>/dev/null || true
+    rm -f "$FIFO" "$RUNNER_PID_FILE" "$GAME_PID_FILE"
+}
+
+cmd_run() {
+    load_config
+    [[ -f "$GAME_DIR/$GAME_EXE" ]] || die "Not installed yet. Run: $SCRIPT_PATH install"
+    check_deps
+    make_dirs
+    is_running && die "The server is already running (pid $(runner_pid))."
+    acquire_lock
+
+    [[ -f "$GAME_DIR/version.dll" && -f "$GAME_DIR/Mods/$MOD_DLL" ]] \
+        || die "MelonLoader or the S1DS mod is missing. Run: $SCRIPT_PATH update"
+    printf '%s\n' "$APP_ID" >"$GAME_DIR/steam_appid.txt"
+
+    echo $$ >"$RUNNER_PID_FILE"
+    trap run_cleanup EXIT
+    trap 'STOP_REQUESTED=1' TERM INT HUP
+
+    # Console input: a FIFO kept open read-write on fd 3 so the game never sees EOF.
+    rm -f "$FIFO"
+    mkfifo -m 600 "$FIFO"
+    exec 3<>"$FIFO"
+
+    # Keep the previous log.
+    [[ -f "$LOG_FILE" ]] && mv -f "$LOG_FILE" "$LOG_FILE.1"
+    : >"$LOG_FILE"
+
+    start_xvfb
+
+    export WINEDLLOVERRIDES="version=n,b;steam_api64=n,b;steamclient64=n,b;tier0_s64=n,b;vstdlib_s64=n,b;steamclient=n,b;tier0_s=n,b;vstdlib_s=n,b${WINEDLLOVERRIDES:+;$WINEDLLOVERRIDES}"
+    export SteamAppId="$APP_ID" SteamGameId="$APP_ID"
+
+    local args=(-batchmode -nographics -logFile - --dedicated-server --stdio-console)
+    args+=("${EXTRA_ARGS[@]}")
+
+    info "Starting Schedule I dedicated server (runtime $RUNTIME, port $(config_value serverPort "$SERVER_PORT"))"
+    info "Log: $LOG_FILE"
+    cd "$GAME_DIR"
+    # setsid: keep Ctrl+C in the terminal from killing Wine directly; we stop it gracefully instead.
+    setsid wine "$GAME_EXE" "${args[@]}" <&3 9>&- > >(tee -i -a "$LOG_FILE") 2>&1 &
+    GAME_PID=$!
+    echo "$GAME_PID" >"$GAME_PID_FILE"
+
+    # When run from a terminal, forward typed lines to the server console.
+    if [[ -t 0 ]]; then
+        info "Type server commands here (e.g. help, serverinfo, listplayers, save). Ctrl+C stops the server."
+        cat <&0 >&3 &
+        FORWARDER_PID=$!
+    fi
+
+    local rc=0
+    while :; do
+        if wait "$GAME_PID" 2>/dev/null; then rc=0; else rc=$?; fi
+        if ((STOP_REQUESTED)); then
+            graceful_stop
+            wait "$GAME_PID" 2>/dev/null || true
+            break
+        fi
+        # wait returns >128 when a signal interrupts it; loop if the game still runs.
+        game_alive || break
+    done
+    if ((STOP_REQUESTED)); then
+        info "Server stopped"
+        exit 0
+    fi
+    warn "Server process exited with code $rc"
+    exit "$rc"
+}
+
+# ---------------------------------------------------------------------------
+# Commands: start / stop / restart / status
+# ---------------------------------------------------------------------------
+cmd_start() {
+    load_config
+    if service_installed; then
+        systemctl --user start "$SERVICE_NAME"
+        ok "Started service $SERVICE_NAME. Follow the log with: $SCRIPT_PATH logs -f"
+        return 0
+    fi
+    is_running && die "Already running (pid $(runner_pid))."
+    make_dirs
+    nohup setsid "$SCRIPT_PATH" run </dev/null >>"$LOG_DIR/runner.log" 2>&1 &
+    local i
+    for ((i = 0; i < 50; i++)); do
+        is_running && break
+        sleep 0.2
+    done
+    is_running || die "Server failed to start. See $LOG_DIR/runner.log"
+    ok "Server started in the background (pid $(runner_pid)). Follow the log with: $SCRIPT_PATH logs -f"
+}
+
+cmd_stop() {
+    load_config
+    if service_installed && systemctl --user is-active --quiet "$SERVICE_NAME"; then
+        info "Stopping service $SERVICE_NAME (saves first)"
+        systemctl --user stop "$SERVICE_NAME"
+        ok "Stopped"
+        return 0
+    fi
+    local pid
+    pid=$(runner_pid)
+    [[ -n "$pid" ]] || { info "Server is not running"; return 0; }
+    info "Stopping server (saves first)"
+    kill -TERM "$pid"
+    local waited=0 limit=$((SHUTDOWN_TIMEOUT + 30))
+    while pid_alive "$pid" && ((waited < limit)); do
+        sleep 1
+        waited=$((waited + 1))
+    done
+    pid_alive "$pid" && die "Server did not stop within ${limit}s (pid $pid)"
+    ok "Stopped"
+}
+
+cmd_restart() {
+    cmd_stop
+    cmd_start
+}
+
+config_value() {
+    # Reads a simple "key = value" from server_config.toml; prints $2 if absent.
+    local key=$1 fallback=$2 v=""
+    if [[ -f "$CONFIG_TOML" ]]; then
+        v=$(sed -nE "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*['\"]?([^'\"#]*)['\"]?.*/\1/p" "$CONFIG_TOML" | head -n1)
+        v=${v%"${v##*[![:space:]]}"}
+    fi
+    echo "${v:-$fallback}"
+}
+
+cmd_status() {
+    load_config
+    local port qport
+    port=$(config_value serverPort "$SERVER_PORT")
+    qport=$(config_value steamGameServerQueryPort "$QUERY_PORT")
+    echo "Install dir : $S1DS_HOME"
+    echo "Runtime     : $RUNTIME (Steam branch $BRANCH)"
+    echo "Game        : $([[ -f "$GAME_DIR/$GAME_EXE" ]] && echo installed || echo 'not installed')"
+    echo "Mod         : $([[ -f "$GAME_DIR/Mods/$MOD_DLL" ]] && echo "$MOD_DLL" || echo missing)"
+    echo "Ports       : $port/udp (game), $port/tcp (status), $qport/udp (Steam query)"
+    if is_running; then
+        echo "State       : ${C_GRN}running${C_RESET} (runner pid $(runner_pid), game pid $(cat "$GAME_PID_FILE" 2>/dev/null || echo '?'))"
+        if have ss; then
+            if ss -lnu 2>/dev/null | grep -q ":$port\b"; then
+                echo "Listening   : yes, UDP $port"
+            else
+                echo "Listening   : not yet on UDP $port (still loading? check: s1ds logs)"
+            fi
+        fi
+    else
+        echo "State       : ${C_YEL}stopped${C_RESET}"
+    fi
+    if service_installed; then
+        echo "Service     : $SERVICE_NAME ($(systemctl --user is-enabled "$SERVICE_NAME" 2>/dev/null || true), $(systemctl --user is-active "$SERVICE_NAME" 2>/dev/null || true))"
+    else
+        echo "Service     : not installed (s1ds service install)"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Commands: console / cmd / logs
+# ---------------------------------------------------------------------------
+write_fifo() {
+    is_running || { warn "The server is not running."; return 1; }
+    [[ -p "$FIFO" ]] || { warn "Console pipe $FIFO not found."; return 1; }
+    # shellcheck disable=SC2016  # $1/$2 expand in the child bash
+    timeout 5 bash -c 'printf "%s\n" "$1" >"$2"' _ "$1" "$FIFO" || { warn "Could not write to the server console."; return 1; }
+}
+
+cmd_cmd() {
+    load_config
+    (($#)) || die "Usage: s1ds cmd <command> [args...]   e.g. s1ds cmd listplayers"
+    local before=0
+    [[ -f "$LOG_FILE" ]] && before=$(stat -c %s "$LOG_FILE")
+    write_fifo "$*" || die "Command not sent."
+    sleep 1.5
+    tail -c +"$((before + 1))" "$LOG_FILE" 2>/dev/null || true
+}
+
+cmd_console() {
+    load_config
+    is_running || die "The server is not running."
+    info "Attached to the server console. Type commands (help, serverinfo, listplayers, save ...). Ctrl+D or 'exit' detaches."
+    tail -n 40 -F "$LOG_FILE" 2>/dev/null &
+    local tail_pid=$!
+    trap 'kill $tail_pid 2>/dev/null || true' EXIT
+    local line
+    while IFS= read -r -e line; do
+        [[ "$line" == exit || "$line" == quit ]] && break
+        [[ -z "$line" ]] && continue
+        write_fifo "$line" || break
+    done
+}
+
+cmd_logs() {
+    load_config
+    [[ -f "$LOG_FILE" ]] || die "No log yet at $LOG_FILE"
+    if [[ "${1:-}" == "-f" || "${1:-}" == "--follow" ]]; then
+        tail -n 200 -F "$LOG_FILE"
+    else
+        tail -n "${1:-200}" "$LOG_FILE"
+    fi
+    local ml="$GAME_DIR/MelonLoader/Latest.log"
+    [[ -f "$ml" ]] && info "MelonLoader log: $ml"
+}
+
+# ---------------------------------------------------------------------------
+# Commands: config / firewall
+# ---------------------------------------------------------------------------
+cmd_config() {
+    load_config
+    local target="$CONFIG_TOML"
+    case "${1:-server}" in
+        server) target="$CONFIG_TOML" ;;
+        permissions|perms) target="$PERMISSIONS_TOML" ;;
+        s1ds|manager) target="$CONF_FILE" ;;
+        *) die "Usage: s1ds config [server|permissions|s1ds]" ;;
+    esac
+    [[ -f "$target" ]] || die "$target does not exist yet (start the server once to generate it)."
+    "${EDITOR:-${VISUAL:-nano}}" "$target"
+    if is_running && [[ "$target" != "$CONF_FILE" ]]; then
+        info "Apply changes with: s1ds cmd reloadconfig   (or reloadpermissions). Port changes need: s1ds restart"
+    fi
+}
+
+cmd_firewall() {
+    load_config
+    local port qport sudo=""
+    port=$(config_value serverPort "$SERVER_PORT")
+    qport=$(config_value steamGameServerQueryPort "$QUERY_PORT")
+    ((EUID == 0)) || sudo="sudo"
+    if have ufw && $sudo ufw status 2>/dev/null | grep -q "Status: active"; then
+        $sudo ufw allow "$port/udp" comment "Schedule I game"
+        $sudo ufw allow "$port/tcp" comment "Schedule I status"
+        $sudo ufw allow "$qport/udp" comment "Schedule I Steam query"
+        ok "ufw rules added"
+    elif have firewall-cmd && $sudo firewall-cmd --state >/dev/null 2>&1; then
+        $sudo firewall-cmd --permanent --add-port="$port/udp" --add-port="$port/tcp" --add-port="$qport/udp"
+        $sudo firewall-cmd --reload
+        ok "firewalld rules added"
+    else
+        info "No active ufw or firewalld found; nothing to change on this machine."
+    fi
+    cat >&2 <<EOF
+
+For players outside your home network, forward these ports on your router to
+this machine's LAN IP ($(hostname -I 2>/dev/null | awk '{print $1}')):
+  $port/UDP   game traffic
+  $port/TCP   server status query (add/favorite server in game)
+  $qport/UDP   Steam query
+Do NOT forward the web panel (4051) or the TCP console (4050).
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Commands: backup / restore / import-save
+# ---------------------------------------------------------------------------
+do_backup() {
+    local tag=${1:-manual}
+    [[ -d "$GAME_DIR/UserData" ]] || { warn "No UserData to back up yet"; return 0; }
+    mkdir -p "$BACKUP_DIR"
+    if is_running; then
+        info "Asking the server to save first"
+        write_fifo "save" || true
+        sleep 8
+    fi
+    local file
+    file="$BACKUP_DIR/userdata-$(date +%Y%m%d-%H%M%S)-$tag.tar.gz"
+    tar -czf "$file" -C "$GAME_DIR" UserData
+    ok "Backup written: $file ($(du -h "$file" | cut -f1))"
+    local old
+    # shellcheck disable=SC2012  # our own fixed-format filenames
+    while IFS= read -r old; do
+        rm -f -- "$old"
+    done < <(ls -1t "$BACKUP_DIR"/userdata-*.tar.gz 2>/dev/null | tail -n +"$((BACKUP_KEEP + 1))")
+}
+
+cmd_backup() {
+    load_config
+    do_backup "${1:-manual}"
+}
+
+cmd_restore() {
+    load_config
+    local file=${1:-}
+    [[ -n "$file" ]] || { ls -1t "$BACKUP_DIR"/userdata-*.tar.gz 2>/dev/null || true; die "Usage: s1ds restore <backup.tar.gz>"; }
+    [[ -f "$file" ]] || die "No such file: $file"
+    require_stopped
+    acquire_lock
+    if [[ -d "$GAME_DIR/UserData" ]]; then
+        do_backup "before-restore"
+        rm -rf "$GAME_DIR/UserData"
+    fi
+    tar -xzf "$file" -C "$GAME_DIR"
+    ok "Restored UserData from $file"
+}
+
+cmd_import_save() {
+    load_config
+    local src=${1:-}
+    [[ -n "$src" && -d "$src" ]] || die "Usage: s1ds import-save <path/to/SaveGame_N>"
+    [[ -f "$src/Game.json" ]] || die "$src does not look like a Schedule I save (no Game.json)"
+    local dest
+    dest="$GAME_DIR/UserData/DedicatedServerSave"
+    [[ -d "$dest/Players/Player_0" ]] || die "Start the server once first so it creates $dest, then stop it and import."
+    require_stopped
+    acquire_lock
+    do_backup "before-import"
+    info "Copying world from $src (keeping the server's Players/Player_0)"
+    (cd "$src" && tar -cf - --exclude=./Players/Player_0 .) | (cd "$dest" && tar -xf -)
+    ok "Save imported. Start the server with: s1ds start"
+}
+
+# ---------------------------------------------------------------------------
+# Command: service (systemd user unit)
+# ---------------------------------------------------------------------------
+cmd_service() {
+    load_config
+    have systemctl || die "systemd is not available. Use: $SCRIPT_PATH start"
+    local unit
+    unit=$(service_file)
+    case "${1:-}" in
+        install)
+            mkdir -p "$(dirname "$unit")"
+            cat >"$unit" <<EOF
+[Unit]
+Description=Schedule I dedicated server (S1DedicatedServers on Wine)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=S1DS_HOME=$S1DS_HOME
+ExecStart=$SCRIPT_PATH run
+# Only the s1ds runner gets SIGTERM; it saves and shuts the game down cleanly.
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=$((SHUTDOWN_TIMEOUT + 30))
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=default.target
+EOF
+            systemctl --user daemon-reload
+            systemctl --user enable "$SERVICE_NAME"
+            ok "Installed and enabled $unit"
+            if have loginctl && [[ "$(loginctl show-user "$USER" -p Linger --value 2>/dev/null || true)" != yes ]]; then
+                info "Enabling lingering so the server starts at boot without you logging in (may ask for sudo)"
+                loginctl enable-linger "$USER" 2>/dev/null || sudo loginctl enable-linger "$USER" \
+                    || warn "Could not enable linger. Run: sudo loginctl enable-linger $USER"
+            fi
+            info "Start it now with: $SCRIPT_PATH start"
+            ;;
+        remove|uninstall)
+            systemctl --user disable --now "$SERVICE_NAME" 2>/dev/null || true
+            rm -f "$unit"
+            systemctl --user daemon-reload
+            ok "Removed $unit"
+            ;;
+        *) die "Usage: s1ds service install|remove" ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# Help / dispatch
+# ---------------------------------------------------------------------------
+cmd_help() {
+    cat <<EOF
+s1ds: Schedule I dedicated server manager for Linux (Wine + S1DedicatedServers)
+
+Setup
+  deps                     Install system packages (wine, Xvfb, ...) with sudo
+  install                  Download SteamCMD, the game, MelonLoader and the server mod
+  update [--backup]        Update the game and mods (stops/restarts if running)
+  service install|remove   Run as a systemd user service that starts on boot
+  firewall                 Open the game ports in ufw/firewalld and show router ports
+
+Running
+  run                      Run in the foreground (type commands; Ctrl+C saves and stops)
+  start | stop | restart   Control the background server (uses the service if installed)
+  status                   Show install and run state
+
+Admin
+  console                  Attach to the server console (Ctrl+D detaches)
+  cmd <command...>         Send one console command, e.g. s1ds cmd listplayers
+  logs [-f | N]            Show (or follow) the server log
+  config [server|permissions|s1ds]   Edit server_config.toml / permissions.toml / s1ds.conf
+
+Saves
+  backup                   Archive UserData (configs + world) to $BACKUP_DIR
+  restore <file>           Restore a backup (server must be stopped)
+  import-save <dir>        Import a single-player SaveGame_N folder into the server world
+
+Data directory: $S1DS_HOME  (override with S1DS_HOME=/path)
+EOF
+}
+
+main() {
+    local cmd=${1:-help}
+    shift || true
+    case "$cmd" in
+        deps)                cmd_deps "$@" ;;
+        install)             cmd_install "$@" ;;
+        update)              cmd_update "$@" ;;
+        run)                 cmd_run "$@" ;;
+        start)               cmd_start "$@" ;;
+        stop)                cmd_stop "$@" ;;
+        restart)             cmd_restart "$@" ;;
+        status)              cmd_status "$@" ;;
+        console|attach)      cmd_console "$@" ;;
+        cmd|send)            cmd_cmd "$@" ;;
+        logs|log)            cmd_logs "$@" ;;
+        config)              cmd_config "$@" ;;
+        firewall|ports)      cmd_firewall "$@" ;;
+        backup)              cmd_backup "$@" ;;
+        restore)             cmd_restore "$@" ;;
+        import-save)         cmd_import_save "$@" ;;
+        service)             cmd_service "$@" ;;
+        help|-h|--help)      cmd_help ;;
+        *) cmd_help >&2; die "Unknown command: $cmd" ;;
+    esac
+}
+
+main "$@"
