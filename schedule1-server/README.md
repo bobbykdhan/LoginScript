@@ -16,45 +16,82 @@ save imports.
 
 ## What you need
 
-- A 64-bit Linux PC: Ubuntu/Debian, Fedora, Arch or openSUSE.
+- A 64-bit Linux PC: Ubuntu/Debian, Fedora, Arch or openSUSE. **A headless
+  server works fine (e.g. Ubuntu Server over SSH).** No desktop or monitor is
+  needed: the game runs on a virtual display (Xvfb).
 - At least 2 CPU cores, 4 GB of free RAM and about 10 GB of free disk. 4 cores
   and 8 GB are better for several players. The server runs the whole game,
   headless, under Wine.
 - A Steam account that **owns Schedule I**. SteamCMD uses it once to download
   the game files. The server itself logs in to Steam anonymously, so you can
   keep playing on the same account.
-- Wine 9 or newer. `s1ds deps` installs your distro's Wine. If that version is
-  older than 9, install Wine from [WineHQ](https://gitlab.winehq.org/wine/wine/-/wikis/Download)
-  or use the [Docker option](#docker-alternative).
+- Wine 9 or newer. `s1ds deps` installs it. Where the distro only packages an
+  older Wine (e.g. Ubuntu 22.04, Debian 12), it adds the official WineHQ
+  repository automatically. `s1ds deps --winehq` forces WineHQ's current stable
+  Wine (11), the same version the mod's Docker image uses.
+- A normal (non-root) user to run the server. Wine does not work properly as
+  root, so `s1ds` refuses to run the server as root.
 
-## Quick start
+## Quick start: Ubuntu Server (headless, over SSH)
+
+Step 1. As your usual admin account (the one with `sudo`), install the system
+packages and create a dedicated user for the server:
 
 ```bash
-git clone <this repo> && cd <repo>/schedule1-server
+git clone https://github.com/bobbykdhan/LoginScript.git
+sudo LoginScript/schedule1-server/s1ds deps --winehq    # Wine 11, Xvfb, SteamCMD libraries
 
-./s1ds deps              # install wine, Xvfb, 32-bit libs for SteamCMD (uses sudo)
-./s1ds install           # asks for your Steam username, password and Steam Guard code once
-./s1ds run               # first start takes several minutes; Ctrl+C saves and stops
+sudo adduser --disabled-password --gecos '' schedule1   # the server runs as this user
+sudo loginctl enable-linger schedule1                   # lets its service run at boot without a login
+
+sudo ufw allow 38465/udp && sudo ufw allow 38465/tcp && sudo ufw allow 27016/udp
+# (ufw is off by default on Ubuntu Server. If you turn it on, run `sudo ufw allow OpenSSH` first.)
 ```
 
-When the log says the server is listening, it is ready. To run it in the
-background and start it on boot:
+If the repository is private, `git clone` asks for a GitHub username and a
+personal access token. You can also copy just this folder from another
+machine, e.g. `scp -r schedule1-server you@server:`.
+
+Step 2. Switch to the server user and install the server:
 
 ```bash
-./s1ds service install   # systemd user service + boot start ("linger")
+sudo -iu schedule1
+git clone https://github.com/bobbykdhan/LoginScript.git
+cd LoginScript/schedule1-server
+
+./s1ds install           # asks for your Steam username, password and Steam Guard code once
+./s1ds run               # test run; the first start takes several minutes. Ctrl+C saves and stops
+```
+
+Step 3. When the log shows the server is up, run it in the background so it
+starts at boot and keeps running after you log out of SSH:
+
+```bash
+./s1ds service install
 ./s1ds start
 ./s1ds status
-./s1ds firewall          # opens ports in ufw/firewalld and lists the ports to forward on your router
+./s1ds logs -f           # Ctrl+C stops following the log, not the server
 ```
 
-Everything lives in `~/schedule1-server`. To use another folder, set
+Then forward the ports on your router (see [Ports](#ports)). Everything lives
+in `/home/schedule1/schedule1-server`. To use another folder, set
 `S1DS_HOME=/path` before running any command.
+
+With only 4 GB of RAM, add swap so a memory spike does not kill the server:
+`sudo fallocate -l 4G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile`.
+To keep it after a reboot, add `/swapfile none swap sw 0 0` to `/etc/fstab`.
+
+### Other distros or a desktop PC
+
+The same steps work. Run `./s1ds deps` as a normal user with sudo rights,
+then `./s1ds install` and the rest as that same user. `./s1ds firewall`
+opens the ports in ufw or firewalld if one is active.
 
 ## Commands
 
 | Command | What it does |
 | --- | --- |
-| `s1ds deps` | Installs system packages (wine, Xvfb, cabextract, 32-bit libs) |
+| `s1ds deps [--winehq]` | Installs system packages (Wine, Xvfb, cabextract, 32-bit libs). `--winehq` uses WineHQ's current Wine |
 | `s1ds install` | Downloads SteamCMD, the game, the Steamworks DLLs, MelonLoader and the S1DS server mod. Also sets up the Wine prefix |
 | `s1ds update [--backup]` | Updates the game and the mods. A running server is stopped, backed up and started again |
 | `s1ds run` | Runs the server in the foreground. You can type console commands, and Ctrl+C saves and stops |
@@ -199,6 +236,15 @@ docker compose logs -f
 
 ## Troubleshooting
 
+- **`Do not run the server as root`.** Create the `schedule1` user as shown
+  in the quick start and run everything except `deps` as that user.
+- **`Wine could not create its prefix`.** Look in
+  `~/schedule1-server/logs/wine-setup.log`. Check that `wine --version` works
+  for the server user. Then run `sudo s1ds deps --winehq` and `s1ds install`
+  again.
+- **`Cannot reach your systemd user manager`.** Run
+  `sudo loginctl enable-linger schedule1` from your admin account, then try
+  again from `sudo -iu schedule1`.
 - **The first start sits for minutes.** This is normal. MelonLoader sets up on
   first launch. IL2CPP also generates assemblies. Watch `s1ds logs -f`.
 - **`Could not find Steam runtime DLLs`.** Run `s1ds update`. The Steamworks
